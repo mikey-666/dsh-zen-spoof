@@ -152,7 +152,7 @@ cd C:\Users\20113\dsh-zen-spoof
 pnpm publish
 
 # 路二：推 GitHub（仓库打 dsh-plugin topic），之后
-#   dsh plugin --profile web add github:<你>/<仓库>
+#   dsh plugin --profile web add github:mikey-666/dsh-zen-spoof
 # 首次 git 安装按提示在 profile 的 pnpm-workspace.yaml 加 allowBuilds 放行
 ```
 

@@ -43,5 +43,9 @@
     "opencode",
     "opencode-zen"
   ],
-  "license": "MIT"
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mikey-666/dsh-zen-spoof.git"
+  }
 }
