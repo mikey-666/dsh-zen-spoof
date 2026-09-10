@@ -13,6 +13,7 @@ import {
   QUOTA_EXCEEDED_CODE,
   EMPTY_RESPONSE_CODE,
   CONTEXT_WINDOW_EXCEEDED_CODE,
+  ReasoningEffortId,
   type GenerateOptions,
   type StreamChunk,
   type ContentBlock,
@@ -22,18 +23,26 @@ import {
 } from "@deepseek-ai/dsh-llm";
 
 export const name = "dsh-zen-spoof";
-export const inject = ["llm"];
+export const inject = ["llm", "credentials"];
 
-// ---------------------------------------------------------------------------
-// 配置
-// ---------------------------------------------------------------------------
+// ─── 常量 ───────────────────────────────────────────────────────────────────────
+
+const ZEN_BASE = "https://opencode.ai/zen/v1";
+const FALLBACK_MODELS = [
+  "mimo-v2.5-free",
+  "deepseek-v4-flash-free",
+  "ling-3.0-flash-free",
+  "nemotron-3-ultra-free",
+];
+const RETRYABLE = new Set(["RATE_LIMIT", "SERVER", "TIMEOUT", "TRANSPORT", EMPTY_RESPONSE_CODE]);
+
+// ─── 配置 ───────────────────────────────────────────────────────────────────────
 
 export interface Config {
   apiKey: string;
   apiKeyRef: string;
   baseURL: string;
   providers: string[];
-  models: string[];
   spoofClient: string;
   project: string;
   userAgent: string;
@@ -45,473 +54,165 @@ export interface Config {
 }
 
 export const Config: Schema<Config> = Schema.object({
-  apiKey: Schema.string()
-    .default("")
-    .description("显式 Zen Key；为空时自动复用 dsh 凭据库里的存量 Key"),
-  apiKeyRef: Schema.string()
-    .default("OPENCODE_API_KEY")
-    .description("复用的凭据引用名，与 dsh 设置里 opencode 提供方的 apiKeyEnv 保持一致"),
-  baseURL: Schema.string()
-    .default("https://opencode.ai/zen/v1")
-    .description("Zen 网关地址，不要带 /chat/completions 后缀"),
-  providers: Schema.array(Schema.string())
-    .default(["opencode-zen"])
-    .description("注册的 provider 路由名"),
-  models: Schema.array(Schema.string())
-    .default([
-      "big-pickle",
-      "mimo-v2.5-free",
-      "ling-3.0-flash-fin-free",
-      "nemotron-3-ultra-free",
-      "nemotron-3.5-lightning-free",
-    ])
-    .description("免费模型候选池，用于 429 时轮换"),
-  spoofClient: Schema.string().default("cli").description("伪装的 x-opencode-client"),
-  project: Schema.string().default("dsh").description("伪装的 x-opencode-project"),
-  // 免费档按 UA 白名单放行，必须是 opencode/<版本号> 完整形态（裸 opencode 会吃 MissingSessionID）
-  userAgent: Schema.string().default("opencode/1.18.30").description("伪装的 User-Agent"),
-  enableAutoFallback: Schema.boolean()
-    .default(true)
-    .description("429 / 5xx 时是否在候选池内换模型重试"),
-  maxFallbackAttempts: Schema.number()
-    .default(5)
-    .description("单次 stream 最多换几个模型试"),
-  initialBackoffMs: Schema.number().default(1000).description("轮换前初始等待"),
-  maxBackoffMs: Schema.number().default(30000).description("轮换等待上限"),
-  timeoutMs: Schema.number()
-    .default(120000)
-    .description("空闲超时毫秒数：超过该时长没收到任何分块即超时，0 表示不设超时"),
+  apiKey: Schema.string().default("").description("显式 Key；为空时从凭据库读取"),
+  apiKeyRef: Schema.string().default("OPENCODE_API_KEY").description("凭据库引用名"),
+  baseURL: Schema.string().default(ZEN_BASE).description("Zen 网关地址"),
+  providers: Schema.array(Schema.string()).default(["opencode"]).description("注册的 provider"),
+  spoofClient: Schema.string().default("cli").description("x-opencode-client"),
+  project: Schema.string().default("dsh").description("x-opencode-project"),
+  userAgent: Schema.string().default("opencode/1.18.30").description("User-Agent"),
+  enableAutoFallback: Schema.boolean().default(true).description("429 时自动换模型"),
+  maxFallbackAttempts: Schema.number().default(5).description("最多换几个模型"),
+  initialBackoffMs: Schema.number().default(1000).description("初始退避"),
+  maxBackoffMs: Schema.number().default(30000).description("最大退避"),
+  timeoutMs: Schema.number().default(120000).description("空闲超时 ms"),
 });
 
-// ---------------------------------------------------------------------------
-// 小工具
-// ---------------------------------------------------------------------------
+// ─── 工具函数 ───────────────────────────────────────────────────────────────────
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
+function isRecord(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
 }
 
-function readStringField(obj: Record<string, unknown>, key: string): string | undefined {
-  const value = obj[key];
-  return typeof value === "string" ? value : undefined;
+function pick(obj: Record<string, unknown>, key: string): string | undefined {
+  const v = obj[key];
+  return typeof v === "string" ? v : undefined;
 }
 
-function errorCode(error: unknown): string | undefined {
-  if (error instanceof LlmError && typeof error.code === "string") return error.code;
-  if (isRecord(error)) return readStringField(error, "code");
-  return undefined;
+function randomHex(len: number): string {
+  const bytes = globalThis.crypto?.getRandomValues?.(new Uint8Array(len));
+  return bytes
+    ? Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("")
+    : Array.from({ length: len }, () => Math.random().toString(16).slice(2, 4)).join("");
 }
 
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
-
-/** 网关侧 JSON 里偶发把 arguments 写成对象，统一转成可发送的文本。 */
-function stringifyArgs(value: unknown): string | undefined {
-  if (typeof value === "string") return value;
-  if (isRecord(value) || Array.isArray(value)) {
-    try {
-      return JSON.stringify(value);
-    } catch {
-      return undefined;
-    }
+function readSignal(opts: GenerateOptions): AbortSignal | undefined {
+  const s = opts.signal;
+  if (s instanceof AbortSignal) return s;
+  if (isRecord(s) && typeof s["aborted"] === "boolean" && typeof s["addEventListener"] === "function") {
+    return s as AbortSignal;
   }
   return undefined;
 }
 
-/** 空参数统一成 {}，空字符串发给网关可能直接 400。 */
-function normalizeArgs(value: unknown, fallback: unknown): string {
-  const text = stringifyArgs(value) ?? stringifyArgs(fallback) ?? "{}";
-  return text.length > 0 ? text : "{}";
+function retryAfterMs(res: Response): number {
+  const raw = res.headers.get("retry-after");
+  if (!raw) return 0;
+  const n = Number(raw.trim());
+  if (Number.isFinite(n)) return Math.max(0, n * 1000);
+  const d = Date.parse(raw);
+  return Number.isNaN(d) ? 0 : Math.max(0, d - Date.now());
 }
 
-function readSignal(options: GenerateOptions): AbortSignal | undefined {
-  const maybe = options.signal;
-  if (maybe instanceof AbortSignal) return maybe;
-  // 跨 realm 或 polyfill 的信号 instanceof 会失效，再按形状认一次
-  if (
-    isRecord(maybe) &&
-    typeof maybe["aborted"] === "boolean" &&
-    typeof maybe["addEventListener"] === "function" &&
-    typeof maybe["removeEventListener"] === "function"
-  ) {
-    return maybe as AbortSignal;
+function requestId(res: Response): string | undefined {
+  for (const k of ["x-request-id", "request-id"]) {
+    const v = res.headers.get(k);
+    if (v && v.trim()) return v.trim();
   }
   return undefined;
 }
 
-function sleep(ms: number, signal?: AbortSignal): Promise<void> {
-  return new Promise((resolve, reject) => {
-    if (signal?.aborted) {
-      reject(new LlmError("aborted", "ABORTED"));
-      return;
+function errorDetail(body: string): string {
+  try {
+    const j: unknown = JSON.parse(body);
+    if (isRecord(j)) {
+      const e = isRecord(j["error"]) ? j["error"] : j;
+      return [e["code"], e["type"], e["message"]]
+        .filter((p): p is string => typeof p === "string" && p.length > 0)
+        .join(" ");
     }
-    const timer = setTimeout(() => {
-      signal?.removeEventListener("abort", onAbort);
-      resolve();
-    }, ms);
-    const onAbort = (): void => {
-      clearTimeout(timer);
-      reject(new LlmError("aborted", "ABORTED"));
-    };
-    signal?.addEventListener("abort", onAbort, { once: true });
-  });
+  } catch { /* non-JSON */ }
+  return body;
 }
 
-// ---------------------------------------------------------------------------
-// harness 消息 -> OpenAI 消息（按 dsh-llm 真实类型转换）
-// ---------------------------------------------------------------------------
+// ─── 模型自动发现 ───────────────────────────────────────────────────────────────
 
-interface OpenAITextPart {
-  type: "text";
-  text: string;
+async function discoverFreeModels(baseURL: string): Promise<string[]> {
+  try {
+    const res = await fetch(`${baseURL}/models`, {
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!res.ok) return [...FALLBACK_MODELS];
+    const body = await res.json();
+    if (!isRecord(body) || !Array.isArray(body["data"])) return [...FALLBACK_MODELS];
+    const free = (body["data"] as unknown[])
+      .filter((m): m is Record<string, unknown> => isRecord(m) && typeof m["id"] === "string")
+      .map((m) => m["id"] as string)
+      .filter((id) => id.includes("free"))
+      .sort();
+    return free.length > 0 ? free : [...FALLBACK_MODELS];
+  } catch {
+    return [...FALLBACK_MODELS];
+  }
 }
 
-interface OpenAIImagePart {
-  type: "image_url";
-  image_url: { url: string };
-}
+// ─── 消息转换：harness → OpenAI ────────────────────────────────────────────────
 
-type OpenAIPart = OpenAITextPart | OpenAIImagePart;
-
-interface OpenAIMessage {
-  role: "system" | "user" | "assistant" | "tool";
-  content: string | OpenAIPart[];
-  tool_calls?: Array<{
-    id: string;
-    type: "function";
-    function: { name: string; arguments: string };
-  }>;
-  tool_call_id?: string;
-  name?: string;
-}
-
-/**
- * harness 内容块渲染成纯文本。图片附件在 harness 里是不透明引用，
- * 适配器拿不到字节，按官方 text-only 序列化策略用占位符保住位置。
- * 推理块是模型内部思维，不回传。
- */
-function renderTextBlocks(blocks: readonly ContentBlock[]): string {
-  const texts: string[] = [];
-  for (const block of blocks) {
-    switch (block.type) {
-      case "text":
-        texts.push(block.text);
-        break;
-      case "reasoning":
-        break;
-      case "image":
-        texts.push(OFFLOADED_IMAGE_TEXT);
-        break;
-      case "tool-call":
-        break;
-      case "tool-result": {
-        const nested = renderTextBlocks(block.content);
-        if (nested.length > 0) texts.push(nested);
-        break;
-      }
-      default:
-        break;
+function renderText(blocks: readonly ContentBlock[]): string {
+  const out: string[] = [];
+  for (const b of blocks) {
+    if (b.type === "text") out.push(b.text);
+    else if (b.type === "image") out.push(OFFLOADED_IMAGE_TEXT);
+    else if (b.type === "tool-result") {
+      const inner = renderText(b.content);
+      if (inner) out.push(inner);
     }
   }
-  return texts.join("\n");
+  return out.join("\n");
 }
 
-function toOpenAIMessages(options: GenerateOptions): OpenAIMessage[] {
-  const result: OpenAIMessage[] = [];
-  if (
-    options.system !== undefined &&
-    !options.messages.some((entry) => entry.role === "system")
-  ) {
-    result.push({ role: "system", content: options.system });
+function toMessages(opts: GenerateOptions) {
+  const msgs: Array<Record<string, unknown>> = [];
+  if (opts.system && !opts.messages.some((m) => m.role === "system")) {
+    msgs.push({ role: "system", content: opts.system });
   }
-
-  for (const entry of options.messages) {
-    // 工具结果：role 为 user、source.kind 为 tool，关联 id 在首块里
+  for (const entry of opts.messages) {
     if (entry.source.kind === "tool") {
       const first = entry.content[0];
-      const text = renderTextBlocks(entry.content);
-      if (first !== undefined && first.type === "tool-result" && first.toolCallId.length > 0) {
-        result.push({ role: "tool", content: text, tool_call_id: first.toolCallId });
-      } else if (text.length > 0) {
-        result.push({ role: "user", content: text });
+      const text = renderText(entry.content);
+      if (first?.type === "tool-result" && first.toolCallId) {
+        msgs.push({ role: "tool", content: text, tool_call_id: first.toolCallId });
+      } else if (text) {
+        msgs.push({ role: "user", content: text });
       }
       continue;
     }
-
     if (entry.role === "assistant") {
       const texts: string[] = [];
-      const toolCalls: NonNullable<OpenAIMessage["tool_calls"]> = [];
-      for (const block of entry.content) {
-        if (block.type === "text") {
-          texts.push(block.text);
-        } else if (block.type === "tool-call") {
-          toolCalls.push({
-            id: block.id,
-            type: "function",
-            function: { name: block.name, arguments: block.arguments },
-          });
+      const calls: Array<Record<string, unknown>> = [];
+      for (const b of entry.content) {
+        if (b.type === "text") texts.push(b.text);
+        else if (b.type === "tool-call") {
+          calls.push({ id: b.id, type: "function", function: { name: b.name, arguments: b.arguments } });
         }
       }
-      result.push({
-        role: "assistant",
-        content: texts.join("\n"),
-        ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
-      });
+      const msg: Record<string, unknown> = { role: "assistant", content: texts.join("\n") };
+      if (calls.length) msg["tool_calls"] = calls;
+      msgs.push(msg);
       continue;
     }
-
-    result.push({ role: entry.role, content: renderTextBlocks(entry.content) });
+    msgs.push({ role: entry.role, content: renderText(entry.content) });
   }
-  return result;
+  return msgs;
 }
 
-/** harness 的生成参数透传给网关，丢了会导致截断位和采样行为对不上。 */
-function buildRequestBody(options: GenerateOptions, model: string): Record<string, unknown> {
-  const body: Record<string, unknown> = {
-    model,
-    messages: toOpenAIMessages(options),
-    stream: true,
-  };
-  if (options.temperature !== undefined) body["temperature"] = options.temperature;
-  if (options.maxTokens !== undefined) body["max_tokens"] = Math.max(1, Math.floor(options.maxTokens));
-  if (options.stop !== undefined) body["stop"] = options.stop;
-  if (options.tools !== undefined && options.tools.length > 0) {
-    body["tools"] = options.tools.map((tool) => ({
+function buildBody(opts: GenerateOptions, model: string): Record<string, unknown> {
+  const body: Record<string, unknown> = { model, messages: toMessages(opts), stream: true };
+  if (opts.temperature !== undefined) body["temperature"] = opts.temperature;
+  if (opts.maxTokens !== undefined) body["max_tokens"] = Math.max(1, Math.floor(opts.maxTokens));
+  if (opts.stop !== undefined) body["stop"] = opts.stop;
+  // 透传 reasoningEffort 给 Zen API，启用思考模式
+  if (opts.reasoningEffort !== undefined) body["reasoning_effort"] = opts.reasoningEffort;
+  if (opts.tools?.length) {
+    body["tools"] = opts.tools.map((t) => ({
       type: "function" as const,
-      function: { name: tool.name, description: tool.description, parameters: tool.parameters },
+      function: { name: t.name, description: t.description, parameters: t.parameters },
     }));
   }
   return body;
 }
 
-// ---------------------------------------------------------------------------
-// SSE 解析：OpenAI delta -> StreamChunk
-// ---------------------------------------------------------------------------
-
-interface OpenAIDelta {
-  content?: string;
-  refusal?: string;
-  tool_calls?: Array<{
-    index?: number;
-    id?: string;
-    function?: { name?: string; arguments?: string | Record<string, unknown> };
-  }>;
-}
-
-interface ParsedUsage {
-  inputTokens: number;
-  outputTokens: number;
-}
-
-/** 文本块固定用 0，工具块用 1、2、3……，满足 harness 的 index 从 0 递增要求。 */
-const TEXT_INDEX = 0;
-const TOOL_INDEX_BASE = 1;
-
-/** 与 harness 默认重试策略对齐的可重试码：耗尽候选后上抛仍可被官方重试接住。 */
-const RETRYABLE_CODES = new Set([
-  "RATE_LIMIT",
-  "SERVER",
-  "TIMEOUT",
-  "TRANSPORT",
-  EMPTY_RESPONSE_CODE,
-]);
-
-function retryAfterMs(response: Response): number {
-  const raw = response.headers.get("retry-after");
-  if (raw === null) return 0;
-  const seconds = Number(raw.trim());
-  if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000);
-  const date = Date.parse(raw);
-  if (!Number.isNaN(date)) return Math.max(0, date - Date.now());
-  return 0;
-}
-
-function providerRequestId(response: Response): string | undefined {
-  for (const key of ["x-request-id", "request-id"]) {
-    const value = response.headers.get(key);
-    if (value !== null && value.trim().length > 0) return value.trim();
-  }
-  return undefined;
-}
-
-/** 网关错误体一般是 {error:{code,type,message}}，拼出来喂给官方分类器。 */
-function providerDetail(body: string): string {
-  try {
-    const parsed: unknown = JSON.parse(body);
-    if (isRecord(parsed)) {
-      const err = isRecord(parsed["error"]) ? parsed["error"] : parsed;
-      const detail = [err["code"], err["type"], err["message"]]
-        .filter((part): part is string => typeof part === "string" && part.length > 0)
-        .join(" ");
-      if (detail.length > 0) return detail;
-    }
-  } catch {
-    // 非 JSON 体直接用原文
-  }
-  return body;
-}
-
-/** 照抄官方 deepseek 适配器的状态码映射，保证码制与重试策略一致。 */
-async function throwForStatus(response: Response): Promise<never> {
-  const body = await response.text().catch(() => "");
-  const detail = providerDetail(body);
-  const snippet = (detail.length > 0 ? detail : body).slice(0, 300);
-  const wait = retryAfterMs(response);
-  const requestId = providerRequestId(response);
-  const facts = {
-    status: response.status,
-    ...(wait > 0 ? { providerRetryAfterMs: wait } : {}),
-    ...(requestId !== undefined ? { requestId: ProviderRequestId(requestId) } : {}),
-  };
-  if (response.status === 401 || response.status === 403) {
-    throw new LlmError(`Zen 鉴权失败 (${response.status}): ${snippet}`, "AUTH", facts);
-  }
-  // 免费档客户端门禁：网关要求真实 OpenCode 客户端，UA 不对或会话不被认可时报此错。
-  // 重试无用，直接给可操作信息（换付费模型 ID 或检查 userAgent 配置）。
-  if (/MissingSessionID/i.test(body) || /only be used in OpenCode/i.test(body)) {
-    throw new LlmError(
-      `Zen 免费档拒绝 (MissingSessionID)：网关只认 OpenCode 客户端。请确认 userAgent 为 opencode/<版本号> 完整形态，或改用付费模型 ID: ${snippet}`,
-      "INVALID_REQUEST",
-      facts,
-    );
-  }
-  if (isQuotaExceededError(detail)) {
-    throw new LlmError(`Zen 配额耗尽: ${snippet}`, QUOTA_EXCEEDED_CODE, facts);
-  }
-  if (response.status === 429) {
-    throw new LlmError(`Zen 免费配额受限 (429): ${snippet}`, "RATE_LIMIT", facts);
-  }
-  if (response.status === 400) {
-    if (isContextWindowExceededError(detail)) {
-      throw new LlmError(`Zen 上下文超限: ${snippet}`, CONTEXT_WINDOW_EXCEEDED_CODE, facts);
-    }
-    throw new LlmError(
-      `Zen 拒绝请求 (400)，请检查 baseURL 与模型名: ${snippet}`,
-      "INVALID_REQUEST",
-      facts,
-    );
-  }
-  if (response.status === 402) {
-    throw new LlmError(`Zen 余额不足或账单异常 (402): ${snippet}`, QUOTA_EXCEEDED_CODE, facts);
-  }
-  if (response.status >= 500) {
-    throw new LlmError(`Zen 网关错误 (${response.status}): ${snippet}`, "SERVER", facts);
-  }
-  throw new LlmError(`Zen 网关错误 (${response.status}): ${snippet}`, `HTTP_${response.status}`, facts);
-}
-
-function extractUsage(data: Record<string, unknown>): ParsedUsage | undefined {
-  const usageRaw = data["usage"];
-  if (!isRecord(usageRaw)) return undefined;
-  const pick = (keys: string[]): number => {
-    for (const key of keys) {
-      const value = usageRaw[key];
-      if (typeof value === "number" && Number.isFinite(value)) return Math.floor(value);
-    }
-    return 0;
-  };
-  return {
-    inputTokens: pick(["prompt_tokens", "input_tokens"]),
-    outputTokens: pick(["completion_tokens", "output_tokens"]),
-  };
-}
-
-function* openBlock(
-  opened: Set<number>,
-  index: number,
-  blockType: "text" | "tool-call",
-): Generator<StreamChunk> {
-  if (!opened.has(index)) {
-    opened.add(index);
-    yield { type: "block-start", index, blockType };
-  }
-}
-
-function* emitTextBlock(text: string): Generator<StreamChunk> {
-  if (text.length === 0) return;
-  yield { type: "block-start", index: TEXT_INDEX, blockType: "text" };
-  yield { type: "text-delta", index: TEXT_INDEX, text };
-  yield { type: "block-end", index: TEXT_INDEX, block: { type: "text", text } };
-}
-
-/** 网关偶发回包为非流式 JSON（content-type 不是 event-stream），这里做兼容。 */
-function* emitNonStreamJson(body: string): Generator<StreamChunk> {
-  let data: Record<string, unknown>;
-  try {
-    const parsed: unknown = JSON.parse(body);
-    if (!isRecord(parsed)) throw new Error("not an object");
-    data = parsed;
-  } catch {
-    throw new LlmError(`Zen 返回了无法解析的非流式响应: ${body.slice(0, 200)}`, "SERVER");
-  }
-  const choices = data["choices"];
-  const first = Array.isArray(choices) && choices.length > 0 && isRecord(choices[0]) ? choices[0] : undefined;
-  const message = first !== undefined && isRecord(first["message"]) ? first["message"] : undefined;
-  const finishReason = first !== undefined ? readStringField(first, "finish_reason") : undefined;
-
-  // 文本与拒绝合并成同一个 0 号块，分两次 emit 会出现两个 block-start 0
-  const textPieces: string[] = [];
-  const content = message !== undefined ? message["content"] : undefined;
-  if (typeof content === "string" && content.length > 0) {
-    textPieces.push(content);
-  } else if (Array.isArray(content)) {
-    const joined = wirePartsToText(content);
-    if (joined.length > 0) textPieces.push(joined);
-  }
-  const refusal = message !== undefined ? readStringField(message, "refusal") : undefined;
-  if (refusal !== undefined && refusal.length > 0) textPieces.push(refusal);
-  if (textPieces.length > 0) yield* emitTextBlock(textPieces.join("\n"));
-
-  const rawCalls = message !== undefined ? message["tool_calls"] : undefined;
-  let toolCount = 0;
-  if (Array.isArray(rawCalls)) {
-    for (const call of rawCalls) {
-      if (!isRecord(call)) continue;
-      const fn = isRecord(call["function"]) ? call["function"] : undefined;
-      const index = TOOL_INDEX_BASE + toolCount;
-      const id = readStringField(call, "id") ?? `call-${index}`;
-      const toolName = (fn !== undefined ? readStringField(fn, "name") : undefined) ?? "tool";
-      const args = normalizeArgs(fn !== undefined ? fn["arguments"] : undefined, undefined);
-      yield { type: "block-start", index, blockType: "tool-call" };
-      yield {
-        type: "tool-call-delta",
-        index,
-        id: CallId(id),
-        name: toolName,
-        argumentsDelta: args,
-      };
-      yield {
-        type: "block-end",
-        index,
-        block: { type: "tool-call", id: CallId(id), name: toolName, arguments: args },
-      };
-      toolCount += 1;
-    }
-  }
-
-  if (toolCount === 0 && textPieces.length === 0) {
-    throw new LlmError("Zen 返回了空响应", EMPTY_RESPONSE_CODE);
-  }
-  const usage = extractUsage(data);
-  if (usage !== undefined) yield { type: "usage", usage };
-  yield { type: "finish", reason: { kind: finishReason === "tool_calls" || toolCount > 0 ? "tool-calls" : "stop" } };
-}
-
-/** 网关侧 parts 数组（{type:text/image_url}）转文本，图片用占位符。 */
-function wirePartsToText(parts: unknown[]): string {
-  const texts: string[] = [];
-  for (const part of parts) {
-    if (!isRecord(part)) continue;
-    if (part["type"] === "text") {
-      const text = readStringField(part, "text");
-      if (text !== undefined) texts.push(text);
-    } else if (part["type"] === "image_url" || part["type"] === "image") {
-      texts.push(OFFLOADED_IMAGE_TEXT);
-    }
-  }
-  return texts.join("\n");
-}
+// ─── SSE 解析 ───────────────────────────────────────────────────────────────────
 
 interface ParseState {
   opened: Set<number>;
@@ -520,457 +221,418 @@ interface ParseState {
   toolId: Map<number, string>;
   toolName: Map<number, string>;
   toolArgs: Map<number, string>;
-  usage: ParsedUsage | undefined;
+  usage: { inputTokens: number; outputTokens: number } | undefined;
   finishKind: "stop" | "tool-calls";
+  /** reasoning index (固定为 -1，与 text/tool 分开) */
+  reasoningIdx: number;
+  reasoningBuf: string;
+  reasoningOpened: boolean;
 }
 
-function* handlePayload(state: ParseState, payload: string): Generator<StreamChunk> {
-  if (payload.length === 0 || payload === "[DONE]") return;
+function extractUsage(d: Record<string, unknown>) {
+  const u = d["usage"];
+  if (!isRecord(u)) return undefined;
+  const pick2 = (keys: string[]) => {
+    for (const k of keys) {
+      const v = u[k];
+      if (typeof v === "number" && Number.isFinite(v)) return Math.floor(v);
+    }
+    return 0;
+  };
+  return { inputTokens: pick2(["prompt_tokens", "input_tokens"]), outputTokens: pick2(["completion_tokens", "output_tokens"]) };
+}
+
+function* handleEvent(state: ParseState, payload: string): Generator<StreamChunk> {
+  if (!payload || payload === "[DONE]") return;
   let data: Record<string, unknown>;
   try {
-    const parsed: unknown = JSON.parse(payload);
-    if (!isRecord(parsed)) return;
-    data = parsed;
-  } catch {
-    return;
-  }
+    const p: unknown = JSON.parse(payload);
+    if (!isRecord(p)) return;
+    data = p;
+  } catch { return; }
+
   const usage = extractUsage(data);
-  if (usage !== undefined) state.usage = usage;
+  if (usage) state.usage = usage;
 
   const choices = data["choices"];
-  if (!Array.isArray(choices) || choices.length === 0) return;
+  if (!Array.isArray(choices) || !choices.length) return;
   const first = choices[0];
   if (!isRecord(first)) return;
-  if (readStringField(first, "finish_reason") === "tool_calls") state.finishKind = "tool-calls";
-  // 个别网关在流里塞 message 而不是 delta，做兼容
-  const deltaRaw = first["delta"] ?? first["message"];
-  if (!isRecord(deltaRaw)) return;
-  const typed = deltaRaw as unknown as OpenAIDelta;
+  if (pick(first, "finish_reason") === "tool_calls") state.finishKind = "tool-calls";
 
-  // 文本增量、数组形态 content 与安全拒绝都按文本块下发，避免静默空轮
-  const textPieces: string[] = [];
-  const deltaContent = (typed as unknown as Record<string, unknown>)["content"];
-  if (typeof deltaContent === "string" && deltaContent.length > 0) {
-    textPieces.push(deltaContent);
-  } else if (Array.isArray(deltaContent)) {
-    const joined = wirePartsToText(deltaContent);
-    if (joined.length > 0) textPieces.push(joined);
+  const delta = first["delta"] ?? first["message"];
+  if (!isRecord(delta)) return;
+
+  // text
+  const textParts: string[] = [];
+  const dc = (delta as Record<string, unknown>)["content"];
+  if (typeof dc === "string" && dc) textParts.push(dc);
+  else if (Array.isArray(dc)) {
+    for (const p of dc) {
+      if (isRecord(p) && p["type"] === "text" && typeof p["text"] === "string") textParts.push(p["text"]);
+      else if (isRecord(p) && (p["type"] === "image_url" || p["type"] === "image")) textParts.push(OFFLOADED_IMAGE_TEXT);
+    }
   }
-  if (typeof typed.refusal === "string" && typed.refusal.length > 0) textPieces.push(typed.refusal);
-  for (const piece of textPieces) {
-    yield* openBlock(state.opened, TEXT_INDEX, "text");
-    state.textBuf.set(TEXT_INDEX, (state.textBuf.get(TEXT_INDEX) ?? "") + piece);
-    yield { type: "text-delta", index: TEXT_INDEX, text: piece };
+  if (typeof delta["refusal"] === "string" && delta["refusal"]) textParts.push(delta["refusal"] as string);
+
+  for (const piece of textParts) {
+    if (!state.opened.has(0)) { state.opened.add(0); yield { type: "block-start", index: 0, blockType: "text" }; }
+    state.textBuf.set(0, (state.textBuf.get(0) ?? "") + piece);
+    yield { type: "text-delta", index: 0, text: piece };
   }
-  if (Array.isArray(typed.tool_calls)) {
-    for (const call of typed.tool_calls) {
-      // 负数 index 会撞上文本块的 0，钳到 0 以上
-      const index = TOOL_INDEX_BASE + Math.max(0, call.index ?? 0);
-      yield* openBlock(state.opened, index, "tool-call");
-      let headerChanged = false;
-      if (typeof call.id === "string" && call.id.length > 0 && state.toolId.get(index) !== call.id) {
-        state.toolId.set(index, call.id);
-        headerChanged = true;
-      }
-      const fnName = call.function?.name;
-      if (typeof fnName === "string" && fnName.length > 0 && state.toolName.get(index) !== fnName) {
-        state.toolName.set(index, fnName);
-        headerChanged = true;
-      }
-      const args = stringifyArgs(call.function?.arguments);
-      if (args !== undefined && args.length > 0) {
-        state.toolArgs.set(index, (state.toolArgs.get(index) ?? "") + args);
-        yield {
-          type: "tool-call-delta",
-          index,
-          id: CallId(state.toolId.get(index) ?? `call-${index}`),
-          name: state.toolName.get(index) ?? "tool",
-          argumentsDelta: args,
-        };
-        state.announced.add(index);
-      } else if (headerChanged && !state.announced.has(index)) {
-        // 首包只有 id + name，先宣告一次，避免下游拿不到调用名
-        yield {
-          type: "tool-call-delta",
-          index,
-          id: CallId(state.toolId.get(index) ?? `call-${index}`),
-          name: state.toolName.get(index) ?? "tool",
-          argumentsDelta: "",
-        };
-        state.announced.add(index);
+
+  // reasoning / thinking（Zen 网关通过 reasoning_content 字段返回思考过程）
+  const reasoningText = delta["reasoning_content"];
+  if (typeof reasoningText === "string" && reasoningText) {
+    if (!state.reasoningOpened) {
+      state.reasoningOpened = true;
+      yield { type: "block-start", index: state.reasoningIdx, blockType: "reasoning" };
+    }
+    state.reasoningBuf += reasoningText;
+    yield { type: "reasoning-delta", index: state.reasoningIdx, text: reasoningText };
+  }
+
+  // tool calls
+  const tc = delta["tool_calls"];
+  if (Array.isArray(tc)) {
+    for (const call of tc) {
+      if (!isRecord(call)) continue;
+      const idx = 1 + Math.max(0, (call["index"] as number) ?? 0);
+      if (!state.opened.has(idx)) { state.opened.add(idx); yield { type: "block-start", index: idx, blockType: "tool-call" }; }
+      let changed = false;
+      if (typeof call["id"] === "string" && call["id"] && state.toolId.get(idx) !== call["id"]) { state.toolId.set(idx, call["id"] as string); changed = true; }
+      const fn = isRecord(call["function"]) ? call["function"] : undefined;
+      const nm = fn ? (fn["name"] as string) : undefined;
+      if (nm && state.toolName.get(idx) !== nm) { state.toolName.set(idx, nm); changed = true; }
+      const args = fn ? (typeof fn["arguments"] === "string" ? fn["arguments"] : undefined) : undefined;
+      if (args) {
+        state.toolArgs.set(idx, (state.toolArgs.get(idx) ?? "") + args);
+        yield { type: "tool-call-delta", index: idx, id: CallId(state.toolId.get(idx) ?? `call-${idx}`), name: state.toolName.get(idx) ?? "tool", argumentsDelta: args };
+        state.announced.add(idx);
+      } else if (changed && !state.announced.has(idx)) {
+        yield { type: "tool-call-delta", index: idx, id: CallId(state.toolId.get(idx) ?? `call-${idx}`), name: state.toolName.get(idx) ?? "tool", argumentsDelta: "" };
+        state.announced.add(idx);
       }
     }
   }
 }
 
-async function* parseSSE(
-  response: Response,
-  onProgress?: () => void,
-): AsyncGenerator<StreamChunk, void, void> {
-  const contentType = response.headers.get("content-type") ?? "";
-  if (!contentType.includes("text/event-stream") && !contentType.includes("stream")) {
-    yield* emitNonStreamJson(await response.text());
+function* emitNonStream(body: string): Generator<StreamChunk> {
+  let data: Record<string, unknown>;
+  try { const p: unknown = JSON.parse(body); if (!isRecord(p)) throw 0; data = p; } catch { throw new LlmError(`Zen 非流式响应无法解析: ${body.slice(0, 200)}`, "SERVER"); }
+  const choices = data["choices"];
+  const first = Array.isArray(choices) && choices.length && isRecord(choices[0]) ? choices[0] : undefined;
+  const msg = first && isRecord(first["message"]) ? first["message"] : undefined;
+  const finish = first ? pick(first, "finish_reason") : undefined;
+
+  // reasoning / thinking（非流式：message.reasoning_content）
+  const reasoningText = msg ? (msg["reasoning_content"] as string | undefined) : undefined;
+  if (typeof reasoningText === "string" && reasoningText) {
+    yield { type: "block-start", index: -1, blockType: "reasoning" };
+    yield { type: "reasoning-delta", index: -1, text: reasoningText };
+    yield { type: "block-end", index: -1, block: { type: "reasoning", text: reasoningText } };
+  }
+
+  const textParts: string[] = [];
+  const content = msg ? msg["content"] : undefined;
+  if (typeof content === "string" && content) textParts.push(content);
+  else if (Array.isArray(content)) {
+    for (const p of content) {
+      if (isRecord(p) && p["type"] === "text" && typeof p["text"] === "string") textParts.push(p["text"]);
+    }
+  }
+  const refusal = msg ? pick(msg, "refusal") : undefined;
+  if (refusal) textParts.push(refusal);
+  if (textParts.length) {
+    yield { type: "block-start", index: 0, blockType: "text" };
+    yield { type: "text-delta", index: 0, text: textParts.join("\n") };
+    yield { type: "block-end", index: 0, block: { type: "text", text: textParts.join("\n") } };
+  }
+
+  const rawCalls = msg ? msg["tool_calls"] : undefined;
+  let toolCount = 0;
+  if (Array.isArray(rawCalls)) {
+    for (const call of rawCalls) {
+      if (!isRecord(call)) continue;
+      const fn = isRecord(call["function"]) ? call["function"] : undefined;
+      const idx = 1 + toolCount;
+      const id = pick(call, "id") ?? `call-${idx}`;
+      const nm = fn ? (pick(fn, "name") ?? "tool") : "tool";
+      const args = fn ? (typeof fn["arguments"] === "string" ? fn["arguments"] : "{}") : "{}";
+      yield { type: "block-start", index: idx, blockType: "tool-call" };
+      yield { type: "tool-call-delta", index: idx, id: CallId(id), name: nm, argumentsDelta: args };
+      yield { type: "block-end", index: idx, block: { type: "tool-call", id: CallId(id), name: nm, arguments: args } };
+      toolCount++;
+    }
+  }
+
+  if (!toolCount && !textParts.length) throw new LlmError("Zen 返回了空响应", EMPTY_RESPONSE_CODE);
+  const usage = extractUsage(data);
+  if (usage) yield { type: "usage", usage };
+  yield { type: "finish", reason: { kind: finish === "tool_calls" || toolCount > 0 ? "tool-calls" : "stop" } };
+}
+
+async function* parseSSE(res: Response, onChunk?: () => void): AsyncGenerator<StreamChunk> {
+  const ct = res.headers.get("content-type") ?? "";
+  if (!ct.includes("text/event-stream") && !ct.includes("stream")) {
+    yield* emitNonStream(await res.text());
     return;
   }
-  if (response.body === null) {
-    throw new LlmError("Zen 返回了空响应体", EMPTY_RESPONSE_CODE);
-  }
+  if (!res.body) throw new LlmError("Zen 返回了空响应体", EMPTY_RESPONSE_CODE);
 
   const state: ParseState = {
-    opened: new Set<number>(),
-    announced: new Set<number>(),
-    textBuf: new Map<number, string>(),
-    toolId: new Map<number, string>(),
-    toolName: new Map<number, string>(),
-    toolArgs: new Map<number, string>(),
-    usage: undefined,
-    finishKind: "stop",
+    opened: new Set(), announced: new Set(),
+    textBuf: new Map(), toolId: new Map(), toolName: new Map(), toolArgs: new Map(),
+    usage: undefined, finishKind: "stop",
+    reasoningIdx: -1, reasoningBuf: "", reasoningOpened: false,
   };
 
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
+  const reader = res.body.getReader();
+  const dec = new TextDecoder();
+  let buf = "";
 
-  const flushEvents = function* (): Generator<StreamChunk> {
-    let boundary = buffer.indexOf("\n\n");
-    while (boundary >= 0) {
-      const rawEvent = buffer.slice(0, boundary);
-      buffer = buffer.slice(boundary + 2);
-      for (const line of rawEvent.split("\n")) {
+  const flush = function* (): Generator<StreamChunk> {
+    let idx = buf.indexOf("\n\n");
+    while (idx >= 0) {
+      const ev = buf.slice(0, idx);
+      buf = buf.slice(idx + 2);
+      for (const line of ev.split("\n")) {
         const trimmed = line.trim().replace(/^\uFEFF/, "");
-        if (trimmed.startsWith("data:")) {
-          yield* handlePayload(state, trimmed.slice(5).trim());
-        }
+        if (trimmed.startsWith("data:")) yield* handleEvent(state, trimmed.slice(5).trim());
       }
-      boundary = buffer.indexOf("\n\n");
+      idx = buf.indexOf("\n\n");
     }
   };
 
   try {
     for (;;) {
       const { done, value } = await reader.read();
-      // done 为 true 时按规范 value 必为空；部分类型声明把 value 标成可选，这里双保险
-      if (done || value === undefined) break;
-      buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n");
-      onProgress?.();
-      yield* flushEvents();
+      if (done || !value) break;
+      buf += dec.decode(value, { stream: true }).replace(/\r\n/g, "\n");
+      onChunk?.();
+      yield* flush();
     }
   } finally {
-    // 读完或中途退出都释放锁，避免连接残留
     reader.releaseLock();
   }
-  buffer += decoder.decode();
-  yield* flushEvents();
-  // 流结束时若还有残余一行（网关没以空行收尾），别丢掉
-  const tail = buffer.trim().replace(/^\uFEFF/, "");
-  if (tail.startsWith("data:")) {
-    yield* handlePayload(state, tail.slice(5).trim());
-  }
+  buf += dec.decode();
+  yield* flush();
+  const tail = buf.trim().replace(/^\uFEFF/, "");
+  if (tail.startsWith("data:")) yield* handleEvent(state, tail.slice(5).trim());
 
-  for (const index of [...state.opened].sort((a, b) => a - b)) {
-    if (index === TEXT_INDEX) {
-      yield {
-        type: "block-end",
-        index,
-        block: { type: "text", text: state.textBuf.get(index) ?? "" },
-      };
+  // 先关闭 reasoning block（在 text/tool 之前，顺序与 pi-ai 对齐）
+  if (state.reasoningOpened) {
+    yield { type: "block-end", index: state.reasoningIdx, block: { type: "reasoning", text: state.reasoningBuf } };
+  }
+  for (const i of [...state.opened].sort((a, b) => a - b)) {
+    if (i === 0) {
+      yield { type: "block-end", index: i, block: { type: "text", text: state.textBuf.get(i) ?? "" } };
     } else {
-      yield {
-        type: "block-end",
-        index,
-        block: {
-          type: "tool-call",
-          id: CallId(state.toolId.get(index) ?? `call-${index}`),
-          name: state.toolName.get(index) ?? "tool",
-          arguments: state.toolArgs.get(index) ?? "{}",
-        },
-      };
+      yield { type: "block-end", index: i, block: { type: "tool-call", id: CallId(state.toolId.get(i) ?? `call-${i}`), name: state.toolName.get(i) ?? "tool", arguments: state.toolArgs.get(i) ?? "{}" } };
     }
   }
-  if (state.opened.size === 0) {
-    // 正常结束但零输出块，按官方契约报空响应而不是吐空消息
-    throw new LlmError("Zen 返回了空响应", EMPTY_RESPONSE_CODE);
-  }
-  // 有工具块但网关没给 finish_reason=tool_calls 时，兜底成 tool-calls，保证 Agent 会执行工具
+  if (!state.opened.size) throw new LlmError("Zen 返回了空响应", EMPTY_RESPONSE_CODE);
   const kind = state.finishKind === "tool-calls" || state.toolId.size > 0 ? "tool-calls" : "stop";
-  if (state.usage !== undefined) yield { type: "usage", usage: state.usage };
+  if (state.usage) yield { type: "usage", usage: state.usage };
   yield { type: "finish", reason: { kind } };
 }
 
-// ---------------------------------------------------------------------------
-// 适配器本体
-// ---------------------------------------------------------------------------
+// ─── 适配器 ─────────────────────────────────────────────────────────────────────
 
-const DEFAULT_BASE_URL = "https://opencode.ai/zen/v1";
-const DEFAULT_MODELS = [
-  "big-pickle",
-  "mimo-v2.5-free",
-  "ling-3.0-flash-fin-free",
-  "nemotron-3-ultra-free",
-  "nemotron-3.5-lightning-free",
-];
+/** 函数级 session 静态变量：同一次对话内复用，跨对话重新生成（与 pi-ai 对齐） */
+let sharedSession: string | undefined;
 
-function asStringArray(value: unknown, fallback: string[]): string[] {
-  if (!Array.isArray(value)) return [...fallback];
-  const cleaned = value.filter((item): item is string => typeof item === "string" && item.length > 0);
-  return cleaned.length > 0 ? cleaned : [...fallback];
-}
-
-function asNumber(value: unknown, fallback: number): number {
-  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
-}
-
-function normalizeConfig(raw: Config): Config {
-  // 直接 new Adapter 传残缺配置时，Schema 默认值不会生效，这里全部兜底；
-  // 显式传空数组属于明确的误配，按 harness 原则大声报错，只有缺字段才回默认值
-  if (Array.isArray(raw.providers) && raw.providers.length === 0) {
-    throw new LlmError("providers 不能为空，至少保留 opencode-zen", "BAD_CONFIG");
-  }
-  if (Array.isArray(raw.models) && raw.models.length === 0) {
-    throw new LlmError("models 不能为空，至少保留一个免费模型 ID", "BAD_CONFIG");
-  }
-  const providers = asStringArray(raw.providers, ["opencode-zen"]);
-  const models = asStringArray(raw.models, DEFAULT_MODELS);
-  const baseURL = (typeof raw.baseURL === "string" ? raw.baseURL : "").replace(/\/+$/, "");
-  return {
-    ...raw,
-    apiKey: typeof raw.apiKey === "string" ? raw.apiKey.trim() : "",
-    apiKeyRef: typeof raw.apiKeyRef === "string" && raw.apiKeyRef.trim().length > 0
-      ? raw.apiKeyRef.trim()
-      : "OPENCODE_API_KEY",
-    userAgent: typeof raw.userAgent === "string" && raw.userAgent.trim().length > 0
-      ? raw.userAgent.trim()
-      : "opencode/1.18.30",
-    baseURL: baseURL.length > 0 ? baseURL : DEFAULT_BASE_URL,
-    providers,
-    models,
-    maxFallbackAttempts: Math.min(
-      Math.max(1, Math.floor(asNumber(raw.maxFallbackAttempts, 5))),
-      models.length + 1,
-    ),
-    initialBackoffMs: Math.max(0, Math.floor(asNumber(raw.initialBackoffMs, 1000))),
-    maxBackoffMs:
-      asNumber(raw.maxBackoffMs, 30000) > 0 ? Math.floor(asNumber(raw.maxBackoffMs, 30000)) : 30000,
-    timeoutMs: Math.max(0, Math.floor(asNumber(raw.timeoutMs, 120000))),
-  };
-}
-
-class ZenSpoofAdapter extends LlmAdapter {
-  private readonly config: Config;
-  private readonly sessionId: string;
+class ZenAdapter extends LlmAdapter {
+  private readonly cfg: Config;
   private readonly ctx: Context;
+  private models: string[] | undefined;
 
-  public constructor(ctx: Context, config: Config) {
+  constructor(ctx: Context, raw: Config) {
     super();
     this.ctx = ctx;
-    this.config = normalizeConfig(config);
-    // session 跨请求复用，request 每次唯一：前者决定免费池的分桶，后者用于追踪
-    this.sessionId = `ses_${Math.random().toString(36).slice(2, 10)}${Date.now().toString(36)}`;
+    this.cfg = {
+      ...raw,
+      apiKey: typeof raw.apiKey === "string" ? raw.apiKey.trim() : "",
+      apiKeyRef: typeof raw.apiKeyRef === "string" && raw.apiKeyRef.trim() ? raw.apiKeyRef.trim() : "OPENCODE_API_KEY",
+      userAgent: typeof raw.userAgent === "string" && raw.userAgent.trim() ? raw.userAgent.trim() : "opencode/1.18.30",
+      baseURL: (raw.baseURL || ZEN_BASE).replace(/\/+$/, ""),
+      maxFallbackAttempts: Math.max(1, Math.min(raw.maxFallbackAttempts ?? 5, 10)),
+      initialBackoffMs: Math.max(0, raw.initialBackoffMs ?? 1000),
+      maxBackoffMs: Math.max(1, raw.maxBackoffMs ?? 30000),
+      timeoutMs: Math.max(0, raw.timeoutMs ?? 120000),
+    };
   }
 
-  public override providerInfo(provider: string): LlmProviderInfo {
-    return { id: provider, name: "OpenCode Zen" };
+  // ── provider / model ──────────────────────────────────────────────────────
+
+  providerInfo(p: string): LlmProviderInfo { return { id: p, name: "OpenCode Zen" }; }
+
+  private async getModels(): Promise<string[]> {
+    if (this.models) return this.models;
+    this.models = await discoverFreeModels(this.cfg.baseURL);
+    return this.models;
   }
 
-  public override listModels(provider: string): Promise<readonly LlmModelInfo[]> {
-    return Promise.resolve(
-      this.config.models.map((id) => ({
-        provider,
-        id,
-        name: id,
-        inputModalities: ["text"] as const,
-      })),
-    );
+  async listModels(p: string): Promise<readonly LlmModelInfo[]> {
+    const list = await this.getModels();
+    return list.map((id) => ({ provider: p, id, name: id, inputModalities: ["text"] as const }));
   }
 
-  public override resolveModel(provider: string, model: string): Promise<LlmResolvedModelInfo> {
-    return Promise.resolve({ provider, id: model, name: model, inputModalities: ["text"] as const });
+  resolveModel(p: string, model: string): Promise<LlmResolvedModelInfo> {
+    // 声明支持 reasoning（避免 harness UNSUPPORTED_REASONING_EFFORT），
+    // 实际不传给 Zen 网关——免费模型用默认行为
+    return Promise.resolve({
+      provider: p, id: model, name: model,
+      inputModalities: ["text"] as const,
+      reasoning: { efforts: [{ id: ReasoningEffortId("high"), name: "High" }], defaultEffort: ReasoningEffortId("high") },
+    });
   }
 
-  private headers(sessionId: string): Headers {
-    const headers = new Headers(attributionHeaders());
-    // 下面这组覆盖 harness 默认 UA，是缓解伪 429 的关键
-    headers.set("User-Agent", this.config.userAgent);
-    headers.set("x-opencode-client", this.config.spoofClient);
-    headers.set("x-opencode-project", this.config.project);
-    headers.set("x-opencode-session", sessionId);
-    headers.set(
-      "x-opencode-request",
-      `msg-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`,
-    );
-    return headers;
-  }
+  // ── 凭据 ──────────────────────────────────────────────────────────────────
 
-  private credentials(): CredentialProvider | undefined {
-    // credentials 服务缺席时回退到环境变量，不让插件整个无法加载
+  private creds(): CredentialProvider | undefined {
     try {
-      const value: unknown = (this.ctx as unknown as Record<string, unknown>)["credentials"];
-      if (
-        value !== null &&
-        typeof value === "object" &&
-        typeof (value as Record<string, unknown>)["resolve"] === "function"
-      ) {
-        return value as CredentialProvider;
-      }
-    } catch {
-      // 取不到就当不存在
-    }
+      const v = (this.ctx as unknown as Record<string, unknown>)["credentials"];
+      if (isRecord(v) && typeof v["resolve"] === "function") return v as unknown as CredentialProvider;
+    } catch { /* ignore */ }
     return undefined;
   }
 
-  /**
-   * 取 Key 顺序与官方 pi-ai 一致：显式配置 > dsh 凭据库（逐请求解析，改钥匙不重启）
-   * > 进程环境变量。每层都修掉首尾空白（凭据库和 env 常带换行），空值视为缺失继续往下找。
-   */
-  private async resolveApiKey(): Promise<string> {
-    const clean = (value: unknown): string | undefined => {
-      if (typeof value !== "string") return undefined;
-      const trimmed = value.trim();
-      return trimmed.length > 0 ? trimmed : undefined;
-    };
-    const fromConfig = clean(this.config.apiKey);
-    if (fromConfig !== undefined) return fromConfig;
-    const ref = credentialRef(this.config.apiKeyRef);
-    const provider = this.credentials();
-    if (provider !== undefined) {
+  private async resolveKey(): Promise<string> {
+    const clean = (v: unknown): string | undefined => (typeof v === "string" && v.trim()) ? v.trim() : undefined;
+    const fromCfg = clean(this.cfg.apiKey);
+    if (fromCfg) return fromCfg;
+    const ref = credentialRef(this.cfg.apiKeyRef);
+    const provider = this.creds();
+    if (provider) {
       const hit = await provider.resolve(ref).catch(() => undefined);
-      const fromStore = hit !== undefined ? clean(hit.value) : undefined;
-      if (hit !== undefined && fromStore !== undefined) {
-        // 只记录来源层级，不记录 Key 本身
-        // eslint-disable-next-line no-console
-        console.info(`[dsh-zen-spoof] Key 来自凭据库（${hit.source}）`);
-        return fromStore;
-      }
+      const val = hit ? clean(hit.value) : undefined;
+      if (val) return val;
     }
-    const fromEnv = clean(process.env[this.config.apiKeyRef]);
-    if (fromEnv !== undefined) return fromEnv;
-    throw new LlmError(
-      `缺 Zen Key：请在 dsh 设置 → 模型 → opencode 提供方里填写，或配置 ${this.config.apiKeyRef}`,
-      "AUTH",
-    );
+    const fromEnv = clean(process.env[this.cfg.apiKeyRef]);
+    if (fromEnv) return fromEnv;
+    throw new LlmError(`缺 Zen Key：请在 dsh 设置里填写，或配置 ${this.cfg.apiKeyRef}`, "AUTH");
   }
 
-  private async *doStream(model: string, options: GenerateOptions): AsyncGenerator<StreamChunk, void, void> {
-    const endpoint = `${this.config.baseURL}/chat/completions`;
-    const apiKey = await this.resolveApiKey();
-    // 会话分桶优先用 harness 的会话 id，拿不到才用实例随机值
-    const headers = this.headers(options.sessionId ?? this.sessionId);
-    headers.set("Content-Type", "application/json");
-    headers.set("Authorization", `Bearer ${apiKey}`);
+  // ── 请求头 ────────────────────────────────────────────────────────────────
 
-    // 超时与 harness 中止信号二合一：超时走 TIMEOUT（可重试），用户中止走 ABORTED
-    const parent = readSignal(options);
-    const controller = new AbortController();
-    if (parent?.aborted === true) controller.abort();
+  private buildHeaders(): Headers {
+    const h = new Headers(attributionHeaders());
+    h.set("User-Agent", this.cfg.userAgent);
+    h.set("x-opencode-client", this.cfg.spoofClient);
+    h.set("x-opencode-project", this.cfg.project);
+    sharedSession ??= `ses_${randomHex(12)}`;
+    h.set("x-opencode-session", sharedSession);
+    h.set("x-opencode-request", `msg_${randomHex(12)}`);
+    return h;
+  }
+
+  // ── 流式请求 ──────────────────────────────────────────────────────────────
+
+  private async *doStream(model: string, opts: GenerateOptions): AsyncGenerator<StreamChunk> {
+    const key = await this.resolveKey();
+    const h = this.buildHeaders();
+    if (opts.sessionId) h.set("x-opencode-session", String(opts.sessionId));
+    h.set("Content-Type", "application/json");
+    h.set("Authorization", `Bearer ${key}`);
+
+    const parent = readSignal(opts);
+    const ctrl = new AbortController();
+    if (parent?.aborted) ctrl.abort();
     let timedOut = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
-    // 空闲口径：收到任何分块即重置，大输出的长尾轮次不会被误杀
-    const armTimer = (): void => {
-      if (timer !== undefined) clearTimeout(timer);
-      timer =
-        this.config.timeoutMs > 0
-          ? setTimeout(() => {
-              timedOut = true;
-              controller.abort();
-            }, this.config.timeoutMs)
-          : undefined;
+    const arm = () => {
+      if (timer) clearTimeout(timer);
+      timer = this.cfg.timeoutMs > 0
+        ? setTimeout(() => { timedOut = true; ctrl.abort(); }, this.cfg.timeoutMs)
+        : undefined;
     };
-    armTimer();
-    const onParentAbort = (): void => controller.abort();
-    parent?.addEventListener("abort", onParentAbort, { once: true });
+    arm();
+    const onAbort = () => ctrl.abort();
+    parent?.addEventListener("abort", onAbort, { once: true });
 
     try {
-      const response = await fetch(endpoint, {
-        method: "POST",
-        headers,
-        body: JSON.stringify(buildRequestBody(options, model)),
-        signal: controller.signal,
+      const res = await fetch(`${this.cfg.baseURL}/chat/completions`, {
+        method: "POST", headers: h,
+        body: JSON.stringify(buildBody(opts, model)),
+        signal: ctrl.signal,
       });
-      if (!response.ok) {
-        await throwForStatus(response);
-      }
-      yield* parseSSE(response, armTimer);
-    } catch (error) {
-      if (error instanceof LlmError) throw error;
-      if (controller.signal.aborted) {
-        if (timedOut) {
-          throw new LlmError(`Zen 请求空闲超时 (${this.config.timeoutMs}ms)`, "TIMEOUT", {
-            cause: error,
-          });
+      if (!res.ok) {
+        const body = await res.text().catch(() => "");
+        const detail = errorDetail(body);
+        const snippet = (detail || body).slice(0, 300);
+        const wait = retryAfterMs(res);
+        const rid = requestId(res);
+        const facts: Record<string, unknown> = { status: res.status };
+        if (wait) facts["providerRetryAfterMs"] = wait;
+        if (rid) facts["requestId"] = ProviderRequestId(rid);
+        if (res.status === 401 || res.status === 403) throw new LlmError(`Zen 鉴权失败 (${res.status}): ${snippet}`, "AUTH", facts);
+        if (/MissingSessionID/i.test(body) || /only be used in OpenCode/i.test(body)) {
+          throw new LlmError(`Zen 免费档拒绝 (MissingSessionID): 确认 UA 为 opencode/<版本号>`, "INVALID_REQUEST", facts);
         }
-        throw new LlmError("aborted", "ABORTED", { cause: error });
+        if (isQuotaExceededError(detail)) throw new LlmError(`Zen 配额耗尽: ${snippet}`, QUOTA_EXCEEDED_CODE, facts);
+        if (res.status === 429) throw new LlmError(`Zen 限流 (429): ${snippet}`, "RATE_LIMIT", facts);
+        if (res.status === 400) {
+          if (isContextWindowExceededError(detail)) throw new LlmError(`Zen 上下文超限: ${snippet}`, CONTEXT_WINDOW_EXCEEDED_CODE, facts);
+          throw new LlmError(`Zen 请求错误 (400): ${snippet}`, "INVALID_REQUEST", facts);
+        }
+        if (res.status === 402) throw new LlmError(`Zen 余额不足 (402): ${snippet}`, QUOTA_EXCEEDED_CODE, facts);
+        if (res.status >= 500) throw new LlmError(`Zen 服务端错误 (${res.status}): ${snippet}`, "SERVER", facts);
+        throw new LlmError(`Zen 错误 (${res.status}): ${snippet}`, `HTTP_${res.status}`, facts);
       }
-      // fetch 的 TypeError（断网、DNS、网关秒断）按官方口径归为传输错误
-      throw new LlmError(`Zen 网络错误: ${errorMessage(error).slice(0, 200)}`, "TRANSPORT", {
-        cause: error,
-      });
+      yield* parseSSE(res, arm);
+    } catch (e) {
+      if (e instanceof LlmError) throw e;
+      if (ctrl.signal.aborted) {
+        if (timedOut) throw new LlmError(`Zen 空闲超时 (${this.cfg.timeoutMs}ms)`, "TIMEOUT", { cause: e });
+        throw new LlmError("aborted", "ABORTED", { cause: e });
+      }
+      throw new LlmError(`Zen 网络错误: ${String(e).slice(0, 200)}`, "TRANSPORT", { cause: e });
     } finally {
-      if (timer !== undefined) clearTimeout(timer);
-      parent?.removeEventListener("abort", onParentAbort);
+      if (timer) clearTimeout(timer);
+      parent?.removeEventListener("abort", onAbort);
     }
   }
 
-  public async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
-    // 选择器有时会带上 provider 前缀（如 opencode-zen/mimo-v2.5-free），网关只认裸 ID
-    const stripPrefix = (id: string): string => {
-      const slash = id.indexOf("/");
-      return slash >= 0 ? id.slice(slash + 1) : id;
-    };
-    const first = stripPrefix(options.model);
-    const pool = [first, ...this.config.models.map(stripPrefix).filter((m) => m !== first)];
-    const candidates = this.config.enableAutoFallback
-      ? pool.slice(0, this.config.maxFallbackAttempts)
-      : pool.slice(0, 1);
+  // ── 主入口：带自动轮换 ─────────────────────────────────────────────────────
 
-    let lastError: unknown;
-    for (let attempt = 0; attempt < candidates.length; attempt += 1) {
-      const model = candidates[attempt];
+  async *stream(opts: GenerateOptions): AsyncIterable<StreamChunk> {
+    const strip = (id: string) => { const i = id.indexOf("/"); return i >= 0 ? id.slice(i + 1) : id; };
+    const first = strip(opts.model);
+    const all = await this.getModels();
+    const pool = [first, ...all.map(strip).filter((m) => m !== first)];
+    const cands = this.cfg.enableAutoFallback ? pool.slice(0, this.cfg.maxFallbackAttempts) : pool.slice(0, 1);
+
+    let lastErr: unknown;
+    for (let i = 0; i < cands.length; i++) {
+      const model = cands[i];
       let yielded = false;
       try {
-        for await (const chunk of this.doStream(model, options)) {
-          yielded = true;
-          yield chunk;
-        }
+        for await (const chunk of this.doStream(model, opts)) { yielded = true; yield chunk; }
         return;
-      } catch (error) {
-        lastError = error;
-        if (yielded) {
-          // 已经吐出过分块，换模型会让同一流里出现重复 index，只能上抛，
-          // 由 harness 在 durable 步骤边界重试，保证装配不乱
-          throw error;
-        }
-        const code = errorCode(error);
-        if (code === "ABORTED") throw error;
-        if (!RETRYABLE_CODES.has(code ?? "") || attempt >= candidates.length - 1) throw error;
-        // 等待时间以 failure 事实位为准，外来错误才回退到消息标记兼容
-        let serverWait = 0;
-        if (error instanceof LlmError && typeof error.failure.providerRetryAfterMs === "number") {
-          serverWait = error.failure.providerRetryAfterMs;
-        } else {
-          const mark = /retry-after-ms=(\d+)/.exec(errorMessage(error))?.[1];
-          if (mark !== undefined) serverWait = Number(mark);
-        }
-        const backoff = Math.min(
-          this.config.maxBackoffMs,
-          Math.max(
-            this.config.initialBackoffMs * 2 ** attempt + Math.floor(Math.random() * 500),
-            serverWait,
-          ),
-        );
-        // eslint-disable-next-line no-console
-        console.warn(
-          `[dsh-zen-spoof] ${model} 受限 (${code})，${backoff}ms 后换 ${candidates[attempt + 1]} 重试`,
-        );
-        await sleep(backoff, readSignal(options));
+      } catch (e) {
+        lastErr = e;
+        if (yielded) throw e;
+        const code = e instanceof LlmError ? e.failure.code : undefined;
+        if (code === "ABORTED") throw e;
+        if (!RETRYABLE.has(code ?? "") || i >= cands.length - 1) throw e;
+        let wait = 0;
+        if (e instanceof LlmError && typeof e.failure.providerRetryAfterMs === "number") wait = e.failure.providerRetryAfterMs;
+        const backoff = Math.min(this.cfg.maxBackoffMs, Math.max(this.cfg.initialBackoffMs * 2 ** i + Math.floor(Math.random() * 500), wait));
+        console.warn(`[dsh-zen-spoof] ${model} 受限 (${code})，${backoff}ms 后换 ${cands[i + 1]}`);
+        await new Promise<void>((resolve, reject) => {
+          const t = setTimeout(resolve, backoff);
+          readSignal(opts)?.addEventListener("abort", () => { clearTimeout(t); reject(new LlmError("aborted", "ABORTED")); }, { once: true });
+        });
       }
     }
-    throw lastError instanceof Error ? lastError : new LlmError("Zen 全部候选模型均受限", "RATE_LIMIT");
+    throw lastErr instanceof Error ? lastErr : new LlmError("Zen 全部候选模型均受限", "RATE_LIMIT");
   }
 }
 
+// ─── 插件入口 ───────────────────────────────────────────────────────────────────
+
 export function apply(ctx: Context, config: Config): void {
-  // Key 不在加载时校验：凭据库的值随时可改，逐请求解析，缺 Key 时请求里再报 AUTH
-  const normalized = normalizeConfig(config);
-  const adapter = new ZenSpoofAdapter(ctx, normalized);
-  ctx.llm.registerAdapter(normalized.providers, adapter);
+  const adapter = new ZenAdapter(ctx, config);
+  ctx.llm.registerAdapter(config.providers ?? ["opencode"], adapter);
 }
