@@ -1,9 +1,9 @@
-# 极简联调配置：name 写 file:// 绝对路径（相对路径按 profile 目录解析）。
-# 把下面路径换成你本机的绝对路径后执行：dsh web --patch <本文件绝对路径>
-# 不填 apiKey：自动复用 dsh 凭据库里的存量 Key。
+# dsh-zen-spoof 本地联调配置
+# 通过 dsh plugin add 安装后不需要此文件
+# 仅用于本地联调：dsh web --patch <此文件路径>
 - insert:
     - id: zen-spoof
-      name: file:///C:/Users/20113/dsh-zen-spoof/src/index.ts
+      name: file:///path/to/dsh-zen-spoof/dist/index.js
       config:
         providers:
-          - opencode-zen
+          - opencode

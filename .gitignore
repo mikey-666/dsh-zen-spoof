@@ -4,3 +4,7 @@ dist/
 *.tsbuildinfo
 *.tgz
 .DS_Store
+Thumbs.db
+.env
+.env.*
+.omo/

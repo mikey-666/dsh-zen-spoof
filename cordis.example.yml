@@ -11,14 +11,8 @@
         apiKeyRef: OPENCODE_API_KEY
         baseURL: https://opencode.ai/zen/v1
         providers:
-          - opencode-zen
-        models:
-          - big-pickle
-          - mimo-v2.5-free
-          - ling-3.0-flash-fin-free
-          - nemotron-3-ultra-free
-          - nemotron-3.5-lightning-free
-        spoofClient: tui
+          - opencode
+        spoofClient: cli
         project: dsh
         enableAutoFallback: true
         maxFallbackAttempts: 5

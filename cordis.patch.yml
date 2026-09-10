@@ -8,14 +8,8 @@
         # 如需写死可用 Key，再加 apiKey 字段；覆盖配置时须重述全部键。
         baseURL: https://opencode.ai/zen/v1
         providers:
-          - opencode-zen
-        models:
-          - big-pickle
-          - mimo-v2.5-free
-          - ling-3.0-flash-fin-free
-          - nemotron-3-ultra-free
-          - nemotron-3.5-lightning-free
-        spoofClient: tui
+          - opencode
+        spoofClient: cli
         project: dsh
         enableAutoFallback: true
         maxFallbackAttempts: 5
