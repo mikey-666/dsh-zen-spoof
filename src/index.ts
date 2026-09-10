@@ -36,6 +36,7 @@ export interface Config {
   models: string[];
   spoofClient: string;
   project: string;
+  userAgent: string;
   enableAutoFallback: boolean;
   maxFallbackAttempts: number;
   initialBackoffMs: number;
@@ -67,6 +68,8 @@ export const Config: Schema<Config> = Schema.object({
     .description("免费模型候选池，用于 429 时轮换"),
   spoofClient: Schema.string().default("tui").description("伪装的 x-opencode-client"),
   project: Schema.string().default("dsh").description("伪装的 x-opencode-project"),
+  // 免费档按 UA 白名单放行，必须是 opencode/<版本号> 完整形态（裸 opencode 会吃 MissingSessionID）
+  userAgent: Schema.string().default("opencode/1.18.30").description("伪装的 User-Agent"),
   enableAutoFallback: Schema.boolean()
     .default(true)
     .description("429 / 5xx 时是否在候选池内换模型重试"),
@@ -363,6 +366,15 @@ async function throwForStatus(response: Response): Promise<never> {
   };
   if (response.status === 401 || response.status === 403) {
     throw new LlmError(`Zen 鉴权失败 (${response.status}): ${snippet}`, "AUTH", facts);
+  }
+  // 免费档客户端门禁：网关要求真实 OpenCode 客户端，UA 不对或会话不被认可时报此错。
+  // 重试无用，直接给可操作信息（换付费模型 ID 或检查 userAgent 配置）。
+  if (/MissingSessionID/i.test(body) || /only be used in OpenCode/i.test(body)) {
+    throw new LlmError(
+      `Zen 免费档拒绝 (MissingSessionID)：网关只认 OpenCode 客户端。请确认 userAgent 为 opencode/<版本号> 完整形态，或改用付费模型 ID: ${snippet}`,
+      "INVALID_REQUEST",
+      facts,
+    );
   }
   if (isQuotaExceededError(detail)) {
     throw new LlmError(`Zen 配额耗尽: ${snippet}`, QUOTA_EXCEEDED_CODE, facts);
@@ -726,6 +738,9 @@ function normalizeConfig(raw: Config): Config {
     apiKeyRef: typeof raw.apiKeyRef === "string" && raw.apiKeyRef.trim().length > 0
       ? raw.apiKeyRef.trim()
       : "OPENCODE_API_KEY",
+    userAgent: typeof raw.userAgent === "string" && raw.userAgent.trim().length > 0
+      ? raw.userAgent.trim()
+      : "opencode/1.18.30",
     baseURL: baseURL.length > 0 ? baseURL : DEFAULT_BASE_URL,
     providers,
     models,
@@ -775,7 +790,7 @@ class ZenSpoofAdapter extends LlmAdapter {
   private headers(sessionId: string): Headers {
     const headers = new Headers(attributionHeaders());
     // 下面这组覆盖 harness 默认 UA，是缓解伪 429 的关键
-    headers.set("User-Agent", "opencode");
+    headers.set("User-Agent", this.config.userAgent);
     headers.set("x-opencode-client", this.config.spoofClient);
     headers.set("x-opencode-project", this.config.project);
     headers.set("x-opencode-session", sessionId);
@@ -805,18 +820,30 @@ class ZenSpoofAdapter extends LlmAdapter {
 
   /**
    * 取 Key 顺序与官方 pi-ai 一致：显式配置 > dsh 凭据库（逐请求解析，改钥匙不重启）
-   * > 进程环境变量。全部落空才报 AUTH。
+   * > 进程环境变量。每层都修掉首尾空白（凭据库和 env 常带换行），空值视为缺失继续往下找。
    */
   private async resolveApiKey(): Promise<string> {
-    if (this.config.apiKey.length > 0) return this.config.apiKey;
+    const clean = (value: unknown): string | undefined => {
+      if (typeof value !== "string") return undefined;
+      const trimmed = value.trim();
+      return trimmed.length > 0 ? trimmed : undefined;
+    };
+    const fromConfig = clean(this.config.apiKey);
+    if (fromConfig !== undefined) return fromConfig;
     const ref = credentialRef(this.config.apiKeyRef);
     const provider = this.credentials();
     if (provider !== undefined) {
       const hit = await provider.resolve(ref).catch(() => undefined);
-      if (hit !== undefined && hit.value.length > 0) return hit.value;
+      const fromStore = hit !== undefined ? clean(hit.value) : undefined;
+      if (hit !== undefined && fromStore !== undefined) {
+        // 只记录来源层级，不记录 Key 本身
+        // eslint-disable-next-line no-console
+        console.info(`[dsh-zen-spoof] Key 来自凭据库（${hit.source}）`);
+        return fromStore;
+      }
     }
-    const env = process.env[this.config.apiKeyRef];
-    if (typeof env === "string" && env.length > 0) return env;
+    const fromEnv = clean(process.env[this.config.apiKeyRef]);
+    if (fromEnv !== undefined) return fromEnv;
     throw new LlmError(
       `缺 Zen Key：请在 dsh 设置 → 模型 → opencode 提供方里填写，或配置 ${this.config.apiKeyRef}`,
       "AUTH",

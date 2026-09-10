@@ -1,9 +1,9 @@
-# 极简加载：先 cd 到本目录再加载（name 是相对路径）
-#   dsh web --patch ./cordis.yml
+# 极简联调配置：name 写 file:// 绝对路径（相对路径按 profile 目录解析）。
+# 把下面路径换成你本机的绝对路径后执行：dsh web --patch <本文件绝对路径>
 # 不填 apiKey：自动复用 dsh 凭据库里的存量 Key。
 - insert:
     - id: zen-spoof
-      name: ./src/index.ts
+      name: file:///C:/Users/20113/dsh-zen-spoof/src/index.ts
       config:
         providers:
           - opencode-zen
