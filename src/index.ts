@@ -66,7 +66,7 @@ export const Config: Schema<Config> = Schema.object({
       "nemotron-3.5-lightning-free",
     ])
     .description("免费模型候选池，用于 429 时轮换"),
-  spoofClient: Schema.string().default("tui").description("伪装的 x-opencode-client"),
+  spoofClient: Schema.string().default("cli").description("伪装的 x-opencode-client"),
   project: Schema.string().default("dsh").description("伪装的 x-opencode-project"),
   // 免费档按 UA 白名单放行，必须是 opencode/<版本号> 完整形态（裸 opencode 会吃 MissingSessionID）
   userAgent: Schema.string().default("opencode/1.18.30").description("伪装的 User-Agent"),
@@ -765,7 +765,7 @@ class ZenSpoofAdapter extends LlmAdapter {
     this.ctx = ctx;
     this.config = normalizeConfig(config);
     // session 跨请求复用，request 每次唯一：前者决定免费池的分桶，后者用于追踪
-    this.sessionId = `dsh-${Math.random().toString(36).slice(2, 10)}`;
+    this.sessionId = `ses_${Math.random().toString(36).slice(2, 10)}${Date.now().toString(36)}`;
   }
 
   public override providerInfo(provider: string): LlmProviderInfo {
@@ -796,7 +796,7 @@ class ZenSpoofAdapter extends LlmAdapter {
     headers.set("x-opencode-session", sessionId);
     headers.set(
       "x-opencode-request",
-      `req-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`,
+      `msg-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`,
     );
     return headers;
   }

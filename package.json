@@ -1,6 +1,6 @@
 {
   "name": "dsh-zen-spoof",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "description": "DeepSeek Harness 插件：为 OpenCode Zen 免费模型补上官方客户端头，缓解伪 429 限流",
   "type": "module",
   "main": "./dist/index.js",
