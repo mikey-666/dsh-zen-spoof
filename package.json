@@ -1,0 +1,47 @@
+{
+  "name": "dsh-zen-spoof",
+  "version": "0.2.2",
+  "description": "DeepSeek Harness 插件：为 OpenCode Zen 免费模型补上官方客户端头，缓解伪 429 限流",
+  "type": "module",
+  "main": "./dist/index.js",
+  "files": [
+    "dist",
+    "src",
+    "cordis.patch.yml",
+    "cordis.yml",
+    "cordis.example.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "scripts": {
+    "check": "tsc --noEmit",
+    "build": "tsc",
+    "prepare": "npm run build"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "4.0.1",
+    "@deepseek-ai/schemastery": "3.18.1",
+    "@deepseek-ai/dsh-llm": "0.1.0-rc.8",
+    "@deepseek-ai/dsh-credentials": "0.1.0-rc.6"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.5.0"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "dsh-plugin",
+    "dsh",
+    "deepseek-harness",
+    "opencode",
+    "opencode-zen"
+  ],
+  "license": "MIT"
+}

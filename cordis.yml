@@ -1,0 +1,9 @@
+# 极简加载：先 cd 到本目录再加载（name 是相对路径）
+#   dsh web --patch ./cordis.yml
+# 不填 apiKey：自动复用 dsh 凭据库里的存量 Key。
+- insert:
+    - id: zen-spoof
+      name: ./src/index.ts
+      config:
+        providers:
+          - opencode-zen

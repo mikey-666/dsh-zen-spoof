@@ -1,0 +1,24 @@
+# dsh-zen-spoof 自带的配置层：profile 装上本包后自动生效。
+# 行内用包名引用（不要写相对路径），Node 按 profile 的依赖解析。
+- insert:
+    - id: zen-spoof
+      name: dsh-zen-spoof
+      config:
+        # 不填 apiKey：自动复用 dsh 凭据库里 opencode 提供方的存量 Key（引用名见 apiKeyRef）。
+        # 如需写死可用 Key，再加 apiKey 字段；覆盖配置时须重述全部键。
+        baseURL: https://opencode.ai/zen/v1
+        providers:
+          - opencode-zen
+        models:
+          - big-pickle
+          - mimo-v2.5-free
+          - ling-3.0-flash-fin-free
+          - nemotron-3-ultra-free
+          - nemotron-3.5-lightning-free
+        spoofClient: tui
+        project: dsh
+        enableAutoFallback: true
+        maxFallbackAttempts: 5
+        initialBackoffMs: 1000
+        maxBackoffMs: 30000
+        timeoutMs: 120000

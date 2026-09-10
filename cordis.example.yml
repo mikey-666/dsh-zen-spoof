@@ -1,0 +1,32 @@
+# 完整示例：复制后按需改模型与轮换开关
+# 用法：先 cd 到本目录再加载（name 是相对路径）：
+#   dsh web --patch ./cordis.example.yml
+# 若从别的目录加载，把下面 name 改成该文件的绝对路径。
+- insert:
+    - id: zen-spoof
+      name: ./src/index.ts
+      config:
+        # apiKey 留空即复用 dsh 凭据库；写死可用 Key 时取消下一行注释。
+        # apiKey: sk-xxx
+        apiKeyRef: OPENCODE_API_KEY
+        baseURL: https://opencode.ai/zen/v1
+        providers:
+          - opencode-zen
+        models:
+          - big-pickle
+          - mimo-v2.5-free
+          - ling-3.0-flash-fin-free
+          - nemotron-3-ultra-free
+          - nemotron-3.5-lightning-free
+        spoofClient: tui
+        project: dsh
+        enableAutoFallback: true
+        maxFallbackAttempts: 5
+        initialBackoffMs: 1000
+        maxBackoffMs: 30000
+        timeoutMs: 120000
+
+# 官方重试插件如果发行版自带就不用加，没有的话取消注释：
+# - insert:
+#     - id: llm-retry
+#       name: '@deepseek-ai/dsh-llm-retry'
